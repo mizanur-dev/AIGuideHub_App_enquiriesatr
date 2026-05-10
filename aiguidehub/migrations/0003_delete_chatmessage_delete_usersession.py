@@ -6,7 +6,7 @@ from django.db import migrations
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('chatbot', '0002_usersession'),
+        ('aiguidehub', '0002_usersession'),
     ]
 
     operations = [

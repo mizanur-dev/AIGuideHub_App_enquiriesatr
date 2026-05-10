@@ -34,9 +34,9 @@ HISTORY_MAX_TURNS = 20  # keep last 20 user+assistant exchanges
 
 # Module-level LLM and chain for reuse
 _LLM = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+    model="gemini-2.5-pro",
     google_api_key=settings.GEMINI_API_KEY,
-    temperature=0.3,
+    temperature=0.5,
     max_output_tokens=512,
 )
 
