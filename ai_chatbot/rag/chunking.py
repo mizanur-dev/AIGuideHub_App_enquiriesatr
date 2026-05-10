@@ -1,6 +1,6 @@
-# rag_core/rag/chunking.py
+# ai_chatbot/rag/chunking.py
 from langchain_experimental.text_splitter import SemanticChunker
-from rag_core.rag.embedding import get_embedding_model
+from .embedding import get_embedding_model
 
 def chunk_text(text):
     """

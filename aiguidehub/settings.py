@@ -43,8 +43,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
-    'aiguidehub',
-    'rag_core',
+    'ai_chatbot',
 ]
 
 MIDDLEWARE = [
@@ -57,7 +56,7 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-ROOT_URLCONF = 'ai_chatbot.urls'
+ROOT_URLCONF = 'aiguidehub.urls'
 
 TEMPLATES = [
     {
@@ -75,8 +74,8 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'ai_chatbot.wsgi.application'
-ASGI_APPLICATION = 'ai_chatbot.asgi.application'
+WSGI_APPLICATION = 'aiguidehub.wsgi.application'
+ASGI_APPLICATION = 'aiguidehub.asgi.application'
 
 
 # Database
@@ -92,6 +91,9 @@ DATABASES = {
 
 # Password validation
 # https://docs.djangoproject.com/en/5.1/ref/settings/#auth-password-validators
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 AUTH_PASSWORD_VALIDATORS = [
     {

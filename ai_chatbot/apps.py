@@ -1,6 +1,6 @@
 from django.apps import AppConfig
 
 
-class RagCoreConfig(AppConfig):
+class AiChatbotConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
-    name = "rag_core"
+    name = "ai_chatbot"

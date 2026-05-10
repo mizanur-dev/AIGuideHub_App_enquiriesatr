@@ -1,4 +1,4 @@
-# rag_core/rag/vector_store.py
+# ai_chatbot/rag/vector_store.py
 
 from pinecone import Pinecone
 import os
@@ -35,3 +35,26 @@ def upsert_chunks(chunks, embeddings, namespace):
     for i in range(0, len(vectors), batch_size):
         batch = vectors[i:i + batch_size]
         index.upsert(vectors=batch, namespace=namespace)
+
+
+def index_embeddings(embeddings, namespace):
+    """
+    Indexes the given embeddings in Pinecone.
+    """
+    clear_namespace(namespace)
+    upsert_chunks(embeddings["chunks"], embeddings["embeddings"], namespace)
+
+
+def retrieve_context(query, namespace):
+    """
+    Retrieves the most relevant text chunks from Pinecone.
+    """
+    from .embedding import embed_query
+    query_embedding = embed_query(query)
+    results = index.query(
+        vector=query_embedding,
+        top_k=3,
+        include_metadata=True,
+        namespace=namespace,
+    )
+    return " ".join([match["metadata"]["text"] for match in results["matches"]])

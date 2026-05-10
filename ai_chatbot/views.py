@@ -11,9 +11,9 @@ from django.contrib.sessions.models import Session
 import uuid
 from rest_framework.views import APIView
 from .serializers import PDFUploadSerializer
-from rag_core.rag.ingestion import process_pdf
-from rag_core.rag.embedding import embed_texts
-from rag_core.rag.vector_store import index
+from .rag.ingestion import process_pdf
+from .rag.embedding import embed_texts
+from .rag.vector_store import retrieve_context
 from django.core.files.storage import FileSystemStorage
 import tempfile
 import logging
@@ -34,10 +34,10 @@ HISTORY_MAX_TURNS = 20  # keep last 20 user+assistant exchanges
 
 # Module-level LLM and chain for reuse
 _LLM = ChatGoogleGenerativeAI(
-    model="gemini-2.5-pro",
+    model="gemini-2.5-flash",
     google_api_key=settings.GEMINI_API_KEY,
     temperature=0.5,
-    max_output_tokens=512,
+    max_output_tokens=2048,
 )
 
 _PROMPT = ChatPromptTemplate.from_messages([
@@ -197,48 +197,20 @@ class PDFUploadAPIView(APIView):
         logger.info(f"Processing PDF upload for session: {session_id}")
 
         try:
-            # Synchronous processing pipeline
-            num_chunks = process_pdf(file, session_id)
-            logger.info(f"Successfully processed {num_chunks} chunks for session: {session_id}")
+            # Save the uploaded file to the media directory
+            fs = FileSystemStorage()
+            filename = fs.save(file.name, file)
+            file_path = fs.path(filename)
 
-            # Clear session history on new document
-            try:
-                # instantiate chat view directly to borrow session lookup method
-                chat_view = ChatView()
-                session_obj, session_data = chat_view.get_session_by_custom_id(session_id)
-                if session_obj and session_data:
-                    chat_history_key = f'chat_history_{session_id}'
-                    if chat_history_key in session_data:
-                        session_data[chat_history_key] = []
-                        session_obj.session_data = Session.objects.encode(session_data)
-                        session_obj.save()
-                        logger.info(f"Cleared previous chat history for session: {session_id}")
-            except Exception as e:
-                logger.warning(f"Error clearing chat history (non-fatal): {str(e)}")
+            # Process the PDF from the media directory (loads, chunks, embeds, and stores)
+            num_chunks = process_pdf(file_path, session_id)
+            
+            # Clean up the uploaded file
+            fs.delete(filename)
 
-            return Response({
-                "message": "Document processed and indexed successfully."
-            }, status=status.HTTP_200_OK)
-
+            return Response(
+                {"message": f"PDF processed and {num_chunks} chunks indexed successfully."}, status=200
+            )
         except Exception as e:
-            logger.error(f"Failed to process PDF for session {session_id}: {str(e)}", exc_info=True)
-            return Response({
-                "error": "An error occurred while processing the document. Please try again."
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
-
-
-def retrieve_context(query, session_id):
-    embedding = embed_texts([query])[0]
-
-    results = index.query(
-        vector=embedding,
-        top_k=5,
-        namespace=session_id,
-        include_metadata=True
-    )
-
-    return "\n".join([
-        match["metadata"]["text"]
-        for match in results["matches"]
-    ])
+            logger.error(f"Error processing PDF: {e}")
+            return Response({"error": "Failed to process PDF."}, status=500)
