@@ -10,8 +10,8 @@ from django.conf import settings
 from django.contrib.sessions.models import Session
 import uuid
 from rest_framework.views import APIView
-from .serializers import PDFUploadSerializer
-from .rag.ingestion import process_pdf
+from .serializers import DocumentUploadSerializer
+from .rag.ingestion import process_pdf, process_document_async
 from .rag.embedding import embed_texts
 from .rag.vector_store import retrieve_context
 from django.core.files.storage import FileSystemStorage
@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 
 # Compact, production-oriented system prompt (single source)
 SYSTEM_PROMPT = (
-"You are Anchor AI, the dedicated assistant for the Anchor connection-building platform. Your goal is to help individuals build healthier, more meaningful, and intentional connections in their personal, social, romantic, and professional lives. "
-"Be helpful, honest, and safe. You can answer questions related to general relationship advice (including romantic, friendships, and professional), conversation starters, profile optimization, A-Pods, relationship valuation, and spiritual habits. "
-"Politely decline queries that are completely unrelated to relationships, personal growth, networking, or the platform itself. "
-"Provide practical, empathetic advice, including a mindset shift and a direct next step or message example. "
+"You are a strict, document-based AI assistant. Your sole purpose is to answer user queries using EXACTLY AND ONLY the provided Context below.\n"
+"If the Context provided does not contain the answer, or if the question is unrelated to the Context, "
+"you MUST reply ONLY with the following exact sentence: 'I am unable to provide responses outside of the uploaded documents.'\n"
+"Do NOT use your general knowledge. Do NOT hallucinate. Do NOT guess. Do NOT provide outside advice.\n"
 "Respond in plain text only — no Markdown, no bullets, no numbered lists, no emojis, no code blocks, and no decorative symbols. Use simple sentences and paragraphs."
 )
 
@@ -146,11 +146,15 @@ class ChatView(CreateAPIView):
             elif item.get('type') == 'ai':
                 history_msgs.append(AIMessage(content=item.get('content', '')))
 
-        # Fetch RAG context
-        context = retrieve_context(user_message, session_id)
+        # Fetch RAG context with threshold
+        context = retrieve_context(user_message, session_id, top_k=12, score_threshold=0.40)
 
-        # Prepare final prompt to include context
-        final_prompt = f"""
+        # Fallback safeguard: If no context met the threshold, bypass LLM completely.
+        if not context.strip():
+            ai_text = "I am unable to provide the answer because it is out knowledge of the app."
+        else:
+            # Prepare final prompt to include context
+            final_prompt = f"""
 Context:
 {context}
 
@@ -158,14 +162,14 @@ User:
 {user_message}
 """
 
-        # Invoke chain with module-level prompt/llm and context combined in the input
-        response = _CHAIN.invoke({
-            "input": final_prompt,
-            "history": history_msgs,
-        })
+            # Invoke chain with module-level prompt/llm and context combined in the input
+            response = _CHAIN.invoke({
+                "input": final_prompt,
+                "history": history_msgs,
+            })
 
-        ai_text = response.content if hasattr(response, "content") else str(response)
-        ai_text = _normalize_response(ai_text)
+            ai_text = response.content if hasattr(response, "content") else str(response)
+            ai_text = _normalize_response(ai_text)
 
         # Append new turn and re-trim
         updated_history = trimmed_history + [
@@ -184,33 +188,42 @@ User:
 
 
 
-class PDFUploadAPIView(APIView):
+class DocumentUploadView(APIView):
     def post(self, request):
-        serializer = PDFUploadSerializer(data=request.data)
+        serializer = DocumentUploadSerializer(data=request.data)
 
         if not serializer.is_valid():
             return Response(serializer.errors, status=400)
 
         file = serializer.validated_data["file"]
         session_id = serializer.validated_data["session_id"]
+        file_type = serializer.validated_data["file_type"]
 
-        logger.info(f"Processing PDF upload for session: {session_id}")
+        logger.info(f"Processing upload for session: {session_id}, type: {file_type}")
 
         try:
             # Save the uploaded file to the media directory
             fs = FileSystemStorage()
             filename = fs.save(file.name, file)
             file_path = fs.path(filename)
+            original_filename = file.name
 
-            # Process the PDF from the media directory (loads, chunks, embeds, and stores)
-            num_chunks = process_pdf(file_path, session_id)
+            # Determine actual file type by extension as fallback
+            is_slide_deck = file_type == "slide_deck" or file.name.lower().endswith(('.pptx', '.ppt'))
             
-            # Clean up the uploaded file
-            fs.delete(filename)
-
-            return Response(
-                {"message": f"PDF processed and {num_chunks} chunks indexed successfully."}, status=200
-            )
+            if is_slide_deck:
+                # Async ingestion
+                process_document_async(file_path, "slide_deck", namespace=session_id, original_filename=original_filename)
+                return Response(
+                    {"message": "Document uploaded. Ingestion running in background."}, status=202
+                )
+            else:
+                # Process the PDF synchronously
+                num_chunks = process_pdf(file_path, session_id, original_filename)
+                fs.delete(filename)
+                return Response(
+                    {"message": f"PDF processed and {num_chunks} chunks indexed successfully."}, status=200
+                )
         except Exception as e:
-            logger.error(f"Error processing PDF: {e}")
-            return Response({"error": "Failed to process PDF."}, status=500)
+            logger.error(f"Error processing document: {e}")
+            return Response({"error": "Failed to process document."}, status=500)

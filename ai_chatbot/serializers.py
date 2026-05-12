@@ -13,6 +13,11 @@ class ChatRequestSerializer(serializers.Serializer):
     message = serializers.CharField(max_length=1000)
     session_id = serializers.CharField(required=True)
 
-class PDFUploadSerializer(serializers.Serializer):
+class DocumentUploadSerializer(serializers.Serializer):
     file = serializers.FileField()
     session_id = serializers.CharField()
+    file_type = serializers.ChoiceField(
+        choices=["pdf", "slide_deck"], 
+        default="pdf",
+        required=False
+    )
