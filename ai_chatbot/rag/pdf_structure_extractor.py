@@ -98,16 +98,17 @@ def extract_pdf_structure(pdf_path: str) -> List[Dict]:
         
         # Rule 2: Detect Module ("SECTION X:")
         # Strict casing to avoid matching inline text like "Section 3 of the Criminal Law"
-        section_match = re.match(r'^SECTION\s+\d+(?:[\s:-]+.*)?$', text)
+        section_match = re.match(r'^SECTION\s+(\d+)(?:[\s:-]+.*)?$', text)
         is_module = bool(section_match and len(text) < 100)
         
         if is_module:
+            section_number = section_match.group(1)
             module_name = text
             # Smart join: If next line is a prominent ALL CAPS title (like "LAW AND LEGISLATION"), merge it
             if i + 1 < len(raw_blocks):
                 next_b = raw_blocks[i+1]
                 if next_b['text'].isupper() and len(next_b['text']) < 60:
-                    module_name += f" - {next_b['text']}"
+                    module_name = next_b['text']
                     i += 1 # Consume that line so it doesn't become a subsection
 
             # Commit the previous module
@@ -118,6 +119,7 @@ def extract_pdf_structure(pdf_path: str) -> List[Dict]:
             
             current_module = {
                 'module': module_name,
+                'section_number': section_number,
                 'subsections': []
             }
             current_subsection = None
@@ -169,6 +171,11 @@ def extract_pdf_structure(pdf_path: str) -> List[Dict]:
             if len(text) < 45:
                 is_subsection = True
             
+        # Refinement: If we just created a heading and it has no content yet, 
+        # do not allow consecutive headings. Demote this one to content.
+        if is_subsection and current_subsection and not current_subsection['content'].strip():
+            is_subsection = False
+
         if is_subsection:
             # Commit the previous subsection
             if current_subsection:
@@ -182,8 +189,9 @@ def extract_pdf_structure(pdf_path: str) -> List[Dict]:
         else:
             # Add to content
             if not current_subsection:
+                section_name = f"Section {current_module.get('section_number', '')}" if current_module and 'section_number' in current_module else 'Introduction'
                 current_subsection = {
-                    'name': 'Introduction',
+                    'name': section_name.strip(),
                     'content': ''
                 }
             

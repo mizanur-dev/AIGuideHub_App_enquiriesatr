@@ -77,25 +77,40 @@ class EmailView(CreateAPIView):
     permission_classes = []
 
     def create(self, request, *args, **kwargs):
+        role = self.kwargs.get('role', 'user')  # default to user
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
         email = serializer.validated_data['email']
         
-        # Generate unique session ID based on email
-        session_id = f"{email}_{uuid.uuid4().hex[:8]}"
-        
         # Create a new session
         request.session.create()
         
-        # Store email and our custom session ID
-        request.session['user_email'] = email
-        request.session['custom_session_id'] = session_id
-        
-        return Response({
-            "message": f"Email set successfully: {email}. You can now use the chatbot.",
-            "session_id": session_id
-        }, status=status.HTTP_200_OK)
+        if role == 'admin':
+            session_id = f"admin_{email}_{uuid.uuid4().hex[:8]}"
+            request.session['admin_email'] = email
+            request.session['admin_session_id'] = session_id
+            return Response({
+                "message": f"Admin Email set successfully: {email}. You can now upload documents.",
+                "admin_session_id": session_id
+            }, status=status.HTTP_200_OK)
+        else:
+            # user or legacy
+            session_id = f"user_{email}_{uuid.uuid4().hex[:8]}"
+            request.session['user_email'] = email
+            request.session['user_session_id'] = session_id
+            
+            if role == 'legacy':
+                request.session['custom_session_id'] = session_id
+                return Response({
+                    "message": f"Email set successfully: {email}. You can now use the chatbot.",
+                    "session_id": session_id
+                }, status=status.HTTP_200_OK)
+                
+            return Response({
+                "message": f"User Email set successfully: {email}. You can now use the chatbot.",
+                "user_session_id": session_id
+            }, status=status.HTTP_200_OK)
 
 class ChatView(CreateAPIView):
     serializer_class = ChatRequestSerializer
@@ -107,7 +122,7 @@ class ChatView(CreateAPIView):
         sessions = Session.objects.all()
         for session in sessions:
             session_data = session.get_decoded()
-            if session_data.get('custom_session_id') == session_id:
+            if session_data.get('user_session_id') == session_id or session_data.get('custom_session_id') == session_id:
                 return session, session_data
         return None, None
 
@@ -121,14 +136,14 @@ class ChatView(CreateAPIView):
         if not session_id:
             raise ValidationError("Session ID is required")
         
-        # Find session by custom session ID
+        # Find session by user session ID
         session_obj, session_data = self.get_session_by_custom_id(session_id)
         
         if not session_obj or not session_data:
-            raise NotFound("Invalid session ID. Please set your email first via /api/set_email/")
+            raise NotFound("Invalid session ID. Please set your user email first via /api/set_user_email/")
         
         if 'user_email' not in session_data:
-            raise NotFound("Invalid session. Please set your email first via /api/set_email/")
+            raise NotFound("Invalid session. Please set your user email first.")
         
         # Chat processing with trimmed history
         chat_history_key = f'chat_history_{session_id}'
@@ -146,8 +161,8 @@ class ChatView(CreateAPIView):
             elif item.get('type') == 'ai':
                 history_msgs.append(AIMessage(content=item.get('content', '')))
 
-        # Fetch RAG context with threshold
-        context = retrieve_context(user_message, session_id, top_k=12, score_threshold=0.40)
+        # Fetch RAG context from the globally available knowledge base
+        context = retrieve_context(user_message, "global_knowledge", top_k=12, score_threshold=0.25)
 
         # Fallback safeguard: If no context met the threshold, bypass LLM completely.
         if not context.strip():
@@ -189,6 +204,14 @@ User:
 
 
 class DocumentUploadView(APIView):
+    def get_session_by_admin_id(self, session_id):
+        sessions = Session.objects.all()
+        for session in sessions:
+            session_data = session.get_decoded()
+            if session_data.get('admin_session_id') == session_id or session_data.get('custom_session_id') == session_id:
+                return session, session_data
+        return None, None
+
     def post(self, request):
         from ai_chatbot.rag.pdf_structure_extractor import extract_pdf_structure
         from ai_chatbot.models import Document, Module, Subsection
@@ -201,7 +224,15 @@ class DocumentUploadView(APIView):
         session_id = serializer.validated_data["session_id"]
         file_type = serializer.validated_data["file_type"]
 
-        logger.info(f"Processing upload for session: {session_id}, type: {file_type}")
+        # Validate admin session
+        session_obj, session_data = self.get_session_by_admin_id(session_id)
+        if not session_obj:
+            return Response({"error": "Unauthorized. Only admins can upload documents. Please set an admin email."}, status=403)
+
+        # Use global namespace for indexing so all users can access it
+        indexing_namespace = "global_knowledge"
+
+        logger.info(f"Processing admin upload for session: {session_id}, type: {file_type}")
 
         try:
             from ai_chatbot.serializers import DocumentStructureSerializer
@@ -216,13 +247,13 @@ class DocumentUploadView(APIView):
 
             if is_slide_deck:
                 # Async ingestion
-                process_document_async(file_path, "slide_deck", namespace=session_id, original_filename=original_filename)
+                process_document_async(file_path, "slide_deck", namespace=indexing_namespace, original_filename=original_filename)
                 return Response(
                     {"message": "Document uploaded. Ingestion running in background."}, status=202
                 )
             else:
                 # Process the PDF synchronously (embedding)
-                num_chunks = process_pdf(file_path, session_id, original_filename)
+                num_chunks = process_pdf(file_path, indexing_namespace, original_filename)
 
                 # --- PDF Structure Extraction and Storage ---
                 structure = extract_pdf_structure(file_path)
