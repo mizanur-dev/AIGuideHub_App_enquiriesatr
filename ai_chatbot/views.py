@@ -190,6 +190,8 @@ User:
 
 class DocumentUploadView(APIView):
     def post(self, request):
+        from ai_chatbot.rag.pdf_structure_extractor import extract_pdf_structure
+        from ai_chatbot.models import Document, Module, Subsection
         serializer = DocumentUploadSerializer(data=request.data)
 
         if not serializer.is_valid():
@@ -202,6 +204,7 @@ class DocumentUploadView(APIView):
         logger.info(f"Processing upload for session: {session_id}, type: {file_type}")
 
         try:
+            from ai_chatbot.serializers import DocumentStructureSerializer
             # Save the uploaded file to the media directory
             fs = FileSystemStorage()
             filename = fs.save(file.name, file)
@@ -210,7 +213,7 @@ class DocumentUploadView(APIView):
 
             # Determine actual file type by extension as fallback
             is_slide_deck = file_type == "slide_deck" or file.name.lower().endswith(('.pptx', '.ppt'))
-            
+
             if is_slide_deck:
                 # Async ingestion
                 process_document_async(file_path, "slide_deck", namespace=session_id, original_filename=original_filename)
@@ -218,11 +221,36 @@ class DocumentUploadView(APIView):
                     {"message": "Document uploaded. Ingestion running in background."}, status=202
                 )
             else:
-                # Process the PDF synchronously
+                # Process the PDF synchronously (embedding)
                 num_chunks = process_pdf(file_path, session_id, original_filename)
+
+                # --- PDF Structure Extraction and Storage ---
+                structure = extract_pdf_structure(file_path)
+                doc_obj = Document.objects.create(file=filename)
+                module_order = 0
+                for mod in structure:
+                    module_obj = Module.objects.create(document=doc_obj, name=mod['module'], order=module_order)
+                    module_order += 1
+                    subsection_order = 0
+                    for sub in mod['subsections']:
+                        Subsection.objects.create(
+                            module=module_obj,
+                            name=sub['name'],
+                            content=sub['content'],
+                            order=subsection_order
+                        )
+                        subsection_order += 1
+
+                # Serialize the document structure for response
+                doc_obj.refresh_from_db()
+                serializer = DocumentStructureSerializer(doc_obj)
                 fs.delete(filename)
                 return Response(
-                    {"message": f"PDF processed and {num_chunks} chunks indexed successfully."}, status=200
+                    {
+                        "message": f"PDF processed, {num_chunks} chunks indexed, and structure extracted successfully.",
+                        "structure": serializer.data
+                    },
+                    status=200
                 )
         except Exception as e:
             logger.error(f"Error processing document: {e}")
