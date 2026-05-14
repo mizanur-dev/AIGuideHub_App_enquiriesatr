@@ -29,7 +29,7 @@ class ModuleSerializer(serializers.ModelSerializer):
     subsections = SubsectionSerializer(many=True, read_only=True)
     class Meta:
         model = Module
-        fields = ['id', 'name', 'order', 'subsections']
+        fields = ['module_id', 'name', 'order', 'subsections']
 
 class DocumentStructureSerializer(serializers.ModelSerializer):
     modules = ModuleSerializer(many=True, read_only=True)

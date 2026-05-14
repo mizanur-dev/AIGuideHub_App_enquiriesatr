@@ -11,6 +11,7 @@ class Document(models.Model):
 
 
 class Module(models.Model):
+	module_id = models.AutoField(primary_key=True)
 	document = models.ForeignKey('Document', related_name='modules', on_delete=models.CASCADE)
 	name = models.CharField(max_length=512)
 	order = models.PositiveIntegerField(default=0)
