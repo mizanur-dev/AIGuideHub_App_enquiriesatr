@@ -36,3 +36,7 @@ class DocumentStructureSerializer(serializers.ModelSerializer):
     class Meta:
         model = Document
         fields = ['id', 'file', 'uploaded_at', 'modules']
+
+class AssessmentRequestSerializer(serializers.Serializer):
+    module_id = serializers.IntegerField(required=True, help_text="ID of the module to generate assessment for.")
+    session_id = serializers.CharField(required=True, help_text="Admin session ID.")

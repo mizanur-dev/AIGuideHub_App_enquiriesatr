@@ -9,11 +9,12 @@ from .serializers import ChatRequestSerializer, ChatResponseSerializer, EmailSer
 from django.conf import settings
 from django.contrib.sessions.models import Session
 import uuid
+import json
 from rest_framework.views import APIView
 from .serializers import DocumentUploadSerializer
-from .rag.ingestion import process_pdf, process_document_async
+from .rag.ingestion import process_pdf, process_document, process_document_async
 from .rag.embedding import embed_texts
-from .rag.vector_store import retrieve_context
+from .rag.vector_store import retrieve_context, delete_document_vectors
 from django.core.files.storage import FileSystemStorage
 import tempfile
 import logging
@@ -112,6 +113,234 @@ class EmailView(CreateAPIView):
                 "user_session_id": session_id
             }, status=status.HTTP_200_OK)
 
+class GenerateAssessmentView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get_session_by_admin_id(self, session_id):
+        from django.contrib.sessions.models import Session
+        sessions = Session.objects.all()
+        for session in sessions:
+            session_data = session.get_decoded()
+            if session_data.get('admin_session_id') == session_id or session_data.get('custom_session_id') == session_id:
+                return session, session_data
+        return None, None
+
+    def post(self, request):
+        from .serializers import AssessmentRequestSerializer
+        from .models import Module
+        import re
+
+        serializer = AssessmentRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        session_id = serializer.validated_data['session_id']
+        module_id = serializer.validated_data['module_id']
+
+        # Admin Session authentication check
+        session_obj, session_data = self.get_session_by_admin_id(session_id)
+        if not session_obj:
+            logger.warning(f"Unauthenticated attempt to generate_assessment with session: {session_id}")
+            return Response({"error": "Unauthorized. Only admins can generate assessments. Please provide a valid admin session_id."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            module = Module.objects.get(module_id=module_id)
+        except Module.DoesNotExist:
+            return Response({"error": f"Module with id {module_id} not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        admin_email = session_data.get("admin_email", "Unknown Admin")
+        logger.info(f"Admin {admin_email} generating assessment for module {module_id}")
+
+        # 1. Gather text from the module to form a query, or directly form context
+        subsections = module.subsections.all()
+        module_text = f"Module: {module.name}\n" + "\n".join(
+            [f"Subsection: {sub.name}\n{sub.content}" for sub in subsections]
+        )
+
+        # 2. Use module-specific retrieval first, then fallback to full module text
+        query_text = module_text[:3000]
+        retrieved_context = retrieve_context(query_text, namespace="global_knowledge", top_k=10, module_id=module_id)
+        if retrieved_context.strip():
+            retrieved_context = module_text + "\n\n---\n\n" + retrieved_context
+        else:
+            retrieved_context = module_text
+
+        def _truncate_text(text, max_chars=6000):
+            return text if len(text) <= max_chars else text[:max_chars]
+
+        def _extract_json_from_text(text):
+            start = text.find("{")
+            if start == -1:
+                raise ValueError("No JSON object found in model output.")
+
+            depth = 0
+            end = None
+            for idx in range(start, len(text)):
+                if text[idx] == "{":
+                    depth += 1
+                elif text[idx] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = idx
+                        break
+
+            if end is None:
+                raise ValueError("No balanced JSON object found in model output.")
+
+            candidate = text[start:end+1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                cleaned = re.sub(r",\s*}\s*$", "}", candidate)
+                cleaned = re.sub(r",\s*\]", "]", cleaned)
+                return json.loads(cleaned)
+
+        def _normalize_parsed_questions(candidate):
+            if not isinstance(candidate, dict):
+                return None
+            questions = candidate.get("questions")
+            if not isinstance(questions, list):
+                return None
+
+            normalized = []
+            for item in questions:
+                if not isinstance(item, dict):
+                    continue
+                if not all(k in item for k in ("question", "options", "correct_option", "justification")):
+                    continue
+                if not isinstance(item["options"], list) or len(item["options"]) != 4:
+                    continue
+                normalized.append({
+                    "question": str(item["question"]).strip(),
+                    "options": [str(opt).strip() for opt in item["options"]],
+                    "correct_option": str(item["correct_option"]).strip(),
+                    "justification": str(item["justification"]).strip(),
+                })
+
+            return normalized if len(normalized) == 5 else None
+
+        def _build_prompt(context, error_message=None):
+            instructions = (
+                "Return exactly one valid JSON object and nothing else. "
+                "The top-level object must include a field named questions. "
+                "Each item in questions must be an object with question, options, correct_option, and justification. "
+                "Options must be exactly 4 items labeled A), B), C), and D). "
+                "The correct_option must be a single letter: A, B, C, or D. "
+                "Do not include any markdown, bullets, or additional explanation."
+            )
+            if error_message:
+                instructions += f" Previous output failed parsing due to: {error_message}. Return valid JSON only."
+            return f"""Generate 5 multiple-choice questions based strictly on the provided content.
+
+{instructions}
+
+Content:
+{context}
+"""
+
+        from pydantic import BaseModel, Field
+        from typing import List
+
+        class MCQ(BaseModel):
+            question: str
+            options: List[str] = Field(description="Exactly 4 options.", min_length=4, max_length=4)
+            correct_option: str = Field(description="The correct option letter or option text.")
+            justification: str
+
+        class AssessmentOutput(BaseModel):
+            questions: List[MCQ] = Field(description="Exactly 5 multiple-choice questions.", min_length=5, max_length=5)
+
+        def normalize_mcq(q):
+            normalized_options = []
+            for idx, opt in enumerate(q["options"]):
+                text = opt.strip()
+                label = chr(ord("A") + idx)
+                if re.match(r"^[A-D]\)", text, re.I):
+                    normalized_options.append(text)
+                else:
+                    stripped = re.sub(r'^[A-D]\)\s*', '', text, flags=re.I).strip()
+                    normalized_options.append(f"{label}) {stripped}")
+
+            raw_answer = q["correct_option"].strip()
+            if re.match(r"^[A-D]$", raw_answer, re.I):
+                correct_letter = raw_answer.upper()
+            elif re.match(r"^[A-D]\)$", raw_answer, re.I):
+                correct_letter = raw_answer[0].upper()
+            else:
+                correct_letter = None
+                for idx, opt in enumerate(normalized_options):
+                    option_text = opt[3:].strip()
+                    if raw_answer.lower() == option_text.lower() or raw_answer.lower() == opt.lower():
+                        correct_letter = chr(ord("A") + idx)
+                        break
+                if correct_letter is None:
+                    raise ValueError("Correct option must be A, B, C, or D, or exactly match one listed option.")
+
+            return {
+                "question": q["question"].strip(),
+                "options": normalized_options,
+                "correct_option": correct_letter,
+                "justification": q["justification"].strip(),
+            }
+
+        prompt_text = _build_prompt(_truncate_text(retrieved_context, 6000))
+        max_retries = 3
+        assessment_data = None
+        raw_text = None
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                structured_llm = _LLM.with_structured_output(AssessmentOutput)
+                response = structured_llm.invoke([HumanMessage(content=prompt_text)])
+
+                if not response or not response.questions:
+                    raise ValueError("LLM returned empty structured output.")
+
+                assessment_data = [q.model_dump() for q in response.questions]
+                break
+
+            except Exception as e:
+                last_error = str(e)
+                logger.debug("Structured output parse attempt %s failed: %s", attempt + 1, e)
+                if attempt < max_retries - 1:
+                    prompt_text = _build_prompt(_truncate_text(retrieved_context, 6000), error_message=last_error)
+                    continue
+
+                try:
+                    raw_response = _LLM.invoke([HumanMessage(content=prompt_text)])
+                    raw_text = raw_response.content if hasattr(raw_response, "content") else str(raw_response)
+                    parsed = _extract_json_from_text(raw_text)
+                    assessment_data = _normalize_parsed_questions(parsed)
+                except Exception as fallback_error:
+                    logger.warning("Structured output fallback parse attempt failed: %s", fallback_error)
+                    last_error = str(fallback_error)
+
+        if not assessment_data:
+            logger.error("Failed to generate assessment after %s attempts. Last error: %s", max_retries, last_error)
+            return Response({"error": "Failed to generate valid assessment format from LLM after multiple attempts."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        if len(assessment_data) != 5:
+            logger.warning("LLM returned wrong number of valid questions: %s", len(assessment_data))
+            return Response({"error": "Failed to generate exactly 5 valid questions."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        normalized_questions = []
+        for q in assessment_data:
+            if len(q["options"]) != 4:
+                return Response({"error": "Failed to generate exactly 4 options per question."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            normalized_q = normalize_mcq(q)
+            normalized_questions.append(normalized_q)
+
+        assessment_data = normalized_questions
+
+        return Response({
+            "success": True,
+            "module_id": module_id,
+            "assessment": assessment_data
+        }, status=status.HTTP_200_OK)
+
 class ChatView(CreateAPIView):
     serializer_class = ChatRequestSerializer
     authentication_classes = []
@@ -166,7 +395,7 @@ class ChatView(CreateAPIView):
 
         # Fallback safeguard: If no context met the threshold, bypass LLM completely.
         if not context.strip():
-            ai_text = "I am unable to provide the answer because it is out knowledge of the app."
+            ai_text = "I am unable to provide the answer because it is outside of our knowledge of the app."
         else:
             # Prepare final prompt to include context
             final_prompt = f"""
@@ -246,43 +475,75 @@ class DocumentUploadView(APIView):
             is_slide_deck = file_type == "slide_deck" or file.name.lower().endswith(('.pptx', '.ppt'))
 
             if is_slide_deck:
-                # Async ingestion
-                process_document_async(file_path, "slide_deck", namespace=indexing_namespace, original_filename=original_filename)
-                return Response(
-                    {"message": "Document uploaded. Ingestion running in background."}, status=202
-                )
-            else:
-                # Process the PDF synchronously (embedding)
-                num_chunks = process_pdf(file_path, indexing_namespace, original_filename)
-
-                # --- PDF Structure Extraction and Storage ---
-                structure = extract_pdf_structure(file_path)
-                doc_obj = Document.objects.create(file=filename)
-                module_order = 0
-                for mod in structure:
-                    module_obj = Module.objects.create(document=doc_obj, name=mod['module'], order=module_order)
-                    module_order += 1
-                    subsection_order = 0
-                    for sub in mod['subsections']:
-                        Subsection.objects.create(
-                            module=module_obj,
-                            name=sub['name'],
-                            content=sub['content'],
-                            order=subsection_order
-                        )
-                        subsection_order += 1
-
-                # Serialize the document structure for response
-                doc_obj.refresh_from_db()
-                serializer = DocumentStructureSerializer(doc_obj)
-                fs.delete(filename)
+                # Synchronous ingestion for slide deck content so PPTX text gets indexed immediately
+                num_chunks = process_document(file_path, "slide_deck", indexing_namespace, original_filename)
                 return Response(
                     {
-                        "message": f"PDF processed, {num_chunks} chunks indexed, and structure extracted successfully.",
-                        "structure": serializer.data
+                        "message": f"Slide deck uploaded successfully and indexed {num_chunks} chunks.",
+                        "num_chunks": num_chunks
                     },
                     status=200
                 )
+            else:
+                # --- PDF Structure Extraction and Storage ---
+                structure = extract_pdf_structure(file_path)
+                if structure:
+                    doc_obj = Document.objects.create(file=filename)
+                    module_order = 0
+                    indexed_structure = []
+
+                    for mod in structure:
+                        module_obj = Module.objects.create(document=doc_obj, name=mod['module'], order=module_order)
+                        module_order += 1
+                        subsection_order = 0
+                        module_entry = {
+                            'module_id': module_obj.module_id,
+                            'module_name': module_obj.name,
+                            'module_order': module_obj.order,
+                            'subsections': []
+                        }
+
+                        for sub in mod['subsections']:
+                            subsection_obj = Subsection.objects.create(
+                                module=module_obj,
+                                name=sub['name'],
+                                content=sub['content'],
+                                order=subsection_order
+                            )
+                            module_entry['subsections'].append({
+                                'subsection_id': subsection_obj.id,
+                                'name': subsection_obj.name,
+                                'content': subsection_obj.content,
+                                'order': subsection_obj.order,
+                            })
+                            subsection_order += 1
+
+                        indexed_structure.append(module_entry)
+
+                    num_chunks = process_pdf(file_path, indexing_namespace, original_filename, structure=indexed_structure)
+
+                    # Serialize the document structure for response
+                    doc_obj.refresh_from_db()
+                    serializer = DocumentStructureSerializer(doc_obj)
+                    fs.delete(filename)
+                    return Response(
+                        {
+                            "message": f"PDF processed, {num_chunks} chunks indexed, and structure extracted successfully.",
+                            "structure": serializer.data
+                        },
+                        status=200
+                    )
+                else:
+                    # Fall back to legacy full-document indexing when structure extraction fails
+                    num_chunks = process_pdf(file_path, indexing_namespace, original_filename)
+                    fs.delete(filename)
+                    return Response(
+                        {
+                            "message": f"PDF processed with fallback indexing, {num_chunks} chunks indexed. No module structure could be extracted.",
+                            "structure": None
+                        },
+                        status=200
+                    )
         except Exception as e:
             logger.error(f"Error processing document: {e}")
             return Response({"error": "Failed to process document."}, status=500)

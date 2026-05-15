@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import ChatView, EmailView, DocumentUploadView
+from .views import ChatView, EmailView, DocumentUploadView, GenerateAssessmentView
 from .structure_views import DocumentStructureView
 
 urlpatterns = [
@@ -10,4 +10,5 @@ urlpatterns = [
     path('chat/', ChatView.as_view(), name='chat'),
     path("upload_pdf/", DocumentUploadView.as_view()),
     path("document/<int:id>/structure/", DocumentStructureView.as_view(), name="document-structure"),
+    path('generate_assessment/', GenerateAssessmentView.as_view(), name='generate_assessment'),
 ]
