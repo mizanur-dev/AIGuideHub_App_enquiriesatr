@@ -225,7 +225,7 @@ class GenerateAssessmentView(APIView):
                 "Return exactly one valid JSON object and nothing else. "
                 "The top-level object must include a field named questions. "
                 "Each item in questions must be an object with question, options, correct_option, and justification. "
-                "Options must be exactly 4 items labeled A), B), C), and D). "
+                "Options must be exactly 4 items labeled 1), B), C), and D). "
                 "The correct_option must be a single letter: A, B, C, or D. "
                 "Do not include any markdown, bullets, or additional explanation."
             )

@@ -86,7 +86,9 @@ def upsert_chunks(chunks, embeddings, namespace, filename, custom_metadata=None)
             "text": chunk,
             "is_slide": False
         }
-        
+        # Truncate the 'text' field in metadata to avoid Pinecone's 40KB limit
+        if "text" in meta and isinstance(meta["text"], str):
+            meta["text"] = meta["text"][:2000]
         # Add filename to metadata for proper querying and deletion later
         meta["filename"] = filename
         sanitized_meta = _sanitize_metadata(meta)
