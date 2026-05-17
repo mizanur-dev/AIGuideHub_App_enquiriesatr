@@ -225,8 +225,9 @@ class GenerateAssessmentView(APIView):
                 "Return exactly one valid JSON object and nothing else. "
                 "The top-level object must include a field named questions. "
                 "Each item in questions must be an object with question, options, correct_option, and justification. "
-                "Options must be exactly 4 items labeled 1), B), C), and D). "
-                "The correct_option must be a single letter: A, B, C, or D. "
+                "Each question must be prefixed with its number, e.g., 'QUESTION 1', 'QUESTION 2', etc. "
+                "Options must be exactly 4 items, each labeled with a number and a dot, e.g., '1. ...', '2. ...', '3. ...', '4. ...'. "
+                "The correct_option must be a single number: 1, 2, 3, or 4, corresponding to the correct option. "
                 "Do not include any markdown, bullets, or additional explanation."
             )
             if error_message:
@@ -251,36 +252,46 @@ Content:
         class AssessmentOutput(BaseModel):
             questions: List[MCQ] = Field(description="Exactly 5 multiple-choice questions.", min_length=5, max_length=5)
 
-        def normalize_mcq(q):
-            normalized_options = []
-            for idx, opt in enumerate(q["options"]):
-                text = opt.strip()
-                label = chr(ord("A") + idx)
-                if re.match(r"^[A-D]\)", text, re.I):
-                    normalized_options.append(text)
-                else:
-                    stripped = re.sub(r'^[A-D]\)\s*', '', text, flags=re.I).strip()
-                    normalized_options.append(f"{label}) {stripped}")
+        def normalize_mcq(q, idx=None):
+            # Remove any question number prefix from the question text
+            question_text = q["question"].strip()
+            question_text = re.sub(r'^QUESTION\s*\d+[:\.]?\s*', '', question_text, flags=re.I)
 
-            raw_answer = q["correct_option"].strip()
-            if re.match(r"^[A-D]$", raw_answer, re.I):
-                correct_letter = raw_answer.upper()
-            elif re.match(r"^[A-D]\)$", raw_answer, re.I):
-                correct_letter = raw_answer[0].upper()
+            normalized_options = []
+            for i, opt in enumerate(q["options"]):
+                text = opt.strip()
+                # Remove any leading A), B), C), D), 1., 2., etc.
+                text = re.sub(r'^[A-D]\)|^[1-4]\.', '', text, flags=re.I).strip()
+                normalized_options.append(f"{i+1}. {text}")
+
+            raw_answer = str(q["correct_option"]).strip()
+            # Try to match 1-4
+            if re.match(r"^[1-4]$", raw_answer):
+                correct_number = raw_answer
             else:
-                correct_letter = None
-                for idx, opt in enumerate(normalized_options):
-                    option_text = opt[3:].strip()
-                    if raw_answer.lower() == option_text.lower() or raw_answer.lower() == opt.lower():
-                        correct_letter = chr(ord("A") + idx)
-                        break
-                if correct_letter is None:
-                    raise ValueError("Correct option must be A, B, C, or D, or exactly match one listed option.")
+                # Try to match A-D and convert to 1-4
+                if re.match(r"^[A-D]$", raw_answer, re.I):
+                    correct_number = str(ord(raw_answer.upper()) - ord('A') + 1)
+                elif re.match(r"^[A-D]\)$", raw_answer, re.I):
+                    correct_number = str(ord(raw_answer[0].upper()) - ord('A') + 1)
+                else:
+                    # Try to match by text
+                    correct_number = None
+                    for i, opt in enumerate(normalized_options):
+                        option_text = opt[3:].strip()
+                        if raw_answer.lower() == option_text.lower() or raw_answer.lower() == opt.lower():
+                            correct_number = str(i+1)
+                            break
+                    if correct_number is None:
+                        raise ValueError("Correct option must be 1, 2, 3, or 4, or exactly match one listed option.")
+
+            # Set the key as 'QUESTION 1', 'QUESTION 2', etc.
+            question_key = f"QUESTION {idx+1}" if idx is not None else "question"
 
             return {
-                "question": q["question"].strip(),
+                question_key: question_text,
                 "options": normalized_options,
-                "correct_option": correct_letter,
+                "correct_option": correct_number,
                 "justification": q["justification"].strip(),
             }
 
@@ -289,6 +300,7 @@ Content:
         assessment_data = None
         raw_text = None
         last_error = None
+
 
         for attempt in range(max_retries):
             try:
@@ -315,22 +327,29 @@ Content:
                     assessment_data = _normalize_parsed_questions(parsed)
                 except Exception as fallback_error:
                     logger.warning("Structured output fallback parse attempt failed: %s", fallback_error)
+                    logger.warning("Raw LLM output: %s", raw_text if 'raw_text' in locals() else "<no output>")
                     last_error = str(fallback_error)
 
         if not assessment_data:
             logger.error("Failed to generate assessment after %s attempts. Last error: %s", max_retries, last_error)
-            return Response({"error": "Failed to generate valid assessment format from LLM after multiple attempts."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            # Return a user-friendly error message, and include raw output for debugging if available
+            error_response = {
+                "error": "Failed to generate valid assessment format from LLM after multiple attempts. The AI did not return a valid JSON object. Please try again later or contact support.",
+            }
+            if raw_text:
+                error_response["llm_output"] = raw_text[:1000]  # Limit output length for safety
+            return Response(error_response, status=status.HTTP_502_BAD_GATEWAY)
 
         if len(assessment_data) != 5:
             logger.warning("LLM returned wrong number of valid questions: %s", len(assessment_data))
             return Response({"error": "Failed to generate exactly 5 valid questions."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         normalized_questions = []
-        for q in assessment_data:
+        for idx, q in enumerate(assessment_data):
             if len(q["options"]) != 4:
                 return Response({"error": "Failed to generate exactly 4 options per question."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-            normalized_q = normalize_mcq(q)
+            normalized_q = normalize_mcq(q, idx)
             normalized_questions.append(normalized_q)
 
         assessment_data = normalized_questions
@@ -472,7 +491,7 @@ class DocumentUploadView(APIView):
             original_filename = file.name
 
             # Determine actual file type by extension as fallback
-            is_slide_deck = file_type == "slide_deck" or file.name.lower().endswith(('.pptx', '.ppt'))
+            is_slide_deck = file_type == "slide_deck" or file.name.lower().endswith((".pptx", ".ppt"))
 
             if is_slide_deck:
                 # Synchronous ingestion for slide deck content so PPTX text gets indexed immediately
@@ -545,5 +564,16 @@ class DocumentUploadView(APIView):
                         status=200
                     )
         except Exception as e:
+            # Handle Google Generative AI 429 RESOURCE_EXHAUSTED error gracefully
+            error_msg = str(e)
+            if (
+                "RESOURCE_EXHAUSTED" in error_msg or
+                "429" in error_msg or
+                (hasattr(e, 'args') and any("RESOURCE_EXHAUSTED" in str(arg) for arg in e.args))
+            ):
+                logger.warning(f"Embedding service quota exceeded: {e}")
+                return Response({
+                    "error": "Embedding service is temporarily unavailable due to quota limits. Please try again later."
+                }, status=503)
             logger.error(f"Error processing document: {e}")
             return Response({"error": "Failed to process document."}, status=500)
