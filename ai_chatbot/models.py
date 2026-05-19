@@ -16,6 +16,16 @@ class Module(models.Model):
 	name = models.CharField(max_length=512)
 	order = models.PositiveIntegerField(default=0)
 
+	# Inferred metadata
+	CATEGORY_CHOICES = [
+		('FOUNDATION', 'FOUNDATION'),
+		('TACTICAL', 'TACTICAL'),
+		('OPERATIONS', 'OPERATIONS'),
+		('LEGAL', 'LEGAL'),
+	]
+	category = models.CharField(max_length=32, choices=CATEGORY_CHOICES, default='FOUNDATION')
+	description = models.TextField(blank=True, default='')
+
 	class Meta:
 		ordering = ['order']
 

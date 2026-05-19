@@ -512,13 +512,33 @@ class DocumentUploadView(APIView):
                     indexed_structure = []
 
                     for mod in structure:
-                        module_obj = Module.objects.create(document=doc_obj, name=mod['module'], order=module_order)
+                        # Aggregate subsection text for metadata inference
+                        subsections_text = "\n".join([s.get('content', '') for s in mod.get('subsections', [])])
+                        try:
+                            from ai_chatbot.rag.metadata import infer_metadata
+                            meta = infer_metadata(mod.get('module'), subsections_text)
+                            category = meta.get('category') if isinstance(meta, dict) else None
+                            description = meta.get('description') if isinstance(meta, dict) else ''
+                        except Exception as e:
+                            logger.warning("Failed to infer metadata for module %s: %s", mod.get('module'), e)
+                            category = None
+                            description = ''
+
+                        create_kwargs = {'document': doc_obj, 'name': mod['module'], 'order': module_order}
+                        if category:
+                            create_kwargs['category'] = category
+                        if description:
+                            create_kwargs['description'] = description
+
+                        module_obj = Module.objects.create(**create_kwargs)
                         module_order += 1
                         subsection_order = 0
                         module_entry = {
                             'module_id': module_obj.module_id,
                             'module_name': module_obj.name,
                             'module_order': module_obj.order,
+                            'category': module_obj.category,
+                            'description': module_obj.description,
                             'subsections': []
                         }
 
