@@ -214,7 +214,7 @@ def extract_pdf_structure(pdf_path: str) -> List[Dict]:
         
         # Rule 2: Detect Module ("SECTION X:")
         # Strict casing to avoid matching inline text like "Section 3 of the Criminal Law"
-        section_match = re.match(r'^SECTION\s+(\d+)(?:[\s:-]+.*)?$', text)
+        section_match = re.match(r'^SECTION\s+([0-9a-zA-Z]+)(?:[\s:-]+.*)?$', text)
         is_module = bool(section_match and len(text) < 100)
         
         if is_module:
@@ -254,10 +254,7 @@ def extract_pdf_structure(pdf_path: str) -> List[Dict]:
             if text.strip().startswith("Lesson "):
                 lesson_val = text.strip()[7:].strip()
             else:
-                if table_i < len(raw_blocks) and raw_blocks[table_i]['text'].strip().isdigit():
-                    lesson_val = raw_blocks[table_i]['text'].strip()
-                    table_i += 1
-                elif table_i < len(raw_blocks) and re.match(r'^\d+$', raw_blocks[table_i]['text'].strip()):
+                if table_i < len(raw_blocks) and raw_blocks[table_i]['text'].strip() != "Topic":
                     lesson_val = raw_blocks[table_i]['text'].strip()
                     table_i += 1
             
