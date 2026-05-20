@@ -513,7 +513,7 @@ class DocumentUploadView(APIView):
 
                     for mod in structure:
                         # Aggregate subsection text for metadata inference
-                        subsections_text = "\n".join([s.get('content', '') for s in mod.get('subsections', [])])
+                        subsections_text = "\n".join([s.get('content', '') for s in mod.get('subsections', []) if s.get('name') != '_module_metadata_table_'])
                         try:
                             from ai_chatbot.rag.metadata import infer_metadata
                             meta = infer_metadata(mod.get('module'), subsections_text)

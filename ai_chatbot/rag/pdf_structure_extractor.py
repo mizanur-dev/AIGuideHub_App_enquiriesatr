@@ -85,6 +85,37 @@ def extract_pdf_structure(pdf_path: str) -> List[Dict]:
     body_font_size = font_size_counts.most_common(1)[0][0]
 
     # ---------------------------------------------------------
+    # PASS 2.5: Merge split heading lines
+    # ---------------------------------------------------------
+    merged_blocks = []
+    for b in raw_blocks:
+        if not merged_blocks:
+            merged_blocks.append(b)
+            continue
+            
+        prev = merged_blocks[-1]
+        text = b['text'].strip()
+        prev_text = prev['text'].strip()
+        
+        is_potential_heading = prev['bold'] or (prev['font_size'] > body_font_size)
+        same_typo = (prev['bold'] == b['bold']) and (prev['font_size'] == b['font_size'])
+        prev_no_punct = not prev_text.endswith(('.', '!', '?', ':', ';'))
+        curr_no_bullet = not text.startswith(('•', '-', '*')) and not re.match(r'^\d+[\.)]', text)
+        is_colon_completion = text.endswith(':') and len(text) < 30
+        starts_lowercase = len(text) > 0 and text[0].islower()
+        is_long_enough_to_wrap = len(prev_text) > 50
+        
+        if is_potential_heading and prev_no_punct and curr_no_bullet:
+            if is_colon_completion or (same_typo and (is_long_enough_to_wrap or starts_lowercase)):
+                if len(prev_text) + len(text) < 150:
+                    prev['text'] = prev_text + " " + text
+                    continue
+                    
+        merged_blocks.append(b)
+        
+    raw_blocks = merged_blocks
+
+    # ---------------------------------------------------------
     # PASS 3: Structure Generation and Hierarchy Building
     # ---------------------------------------------------------
     structure = []
@@ -215,6 +246,68 @@ def extract_pdf_structure(pdf_path: str) -> List[Dict]:
         if not current_module:
             i += 1
             continue
+
+        # Detect tabular structure for Lesson / Topic / Use
+        if text.strip() == "Lesson" or text.strip().startswith("Lesson "):
+            table_i = i + 1
+            lesson_val = None
+            if text.strip().startswith("Lesson "):
+                lesson_val = text.strip()[7:].strip()
+            else:
+                if table_i < len(raw_blocks) and raw_blocks[table_i]['text'].strip().isdigit():
+                    lesson_val = raw_blocks[table_i]['text'].strip()
+                    table_i += 1
+                elif table_i < len(raw_blocks) and re.match(r'^\d+$', raw_blocks[table_i]['text'].strip()):
+                    lesson_val = raw_blocks[table_i]['text'].strip()
+                    table_i += 1
+            
+            if table_i < len(raw_blocks) and raw_blocks[table_i]['text'].strip() == "Topic":
+                table_i += 1
+                topics = []
+                while table_i < len(raw_blocks) and raw_blocks[table_i]['text'].strip() != "Use":
+                    topics.append(raw_blocks[table_i]['text'].strip())
+                    table_i += 1
+                
+                if table_i < len(raw_blocks) and raw_blocks[table_i]['text'].strip() == "Use":
+                    table_i += 1
+                    use_lines = []
+                    while table_i < len(raw_blocks):
+                        nxt_txt = raw_blocks[table_i]['text'].strip()
+                        # Break if it looks like a heading or new module
+                        if nxt_txt.isupper() and len(nxt_txt) < 100:
+                            break
+                        if ":" in nxt_txt or nxt_txt.endswith(('.', '?', '!')):
+                            # Wait, 'Use' content might end with a period.
+                            # Usually the NEXT heading has a colon or is uppercase or bold.
+                            if (raw_blocks[table_i]['bold'] or raw_blocks[table_i]['font_size'] > body_font_size) and not nxt_txt.endswith(('.', '?', '!', ';', ',')):
+                                break
+                            if ":" in nxt_txt and len(nxt_txt.split(':')[0]) < 30: # 'Key principle: ...'
+                                break
+                            if nxt_txt in ["Introduction", "Overview"]:
+                                break
+                        use_lines.append(nxt_txt)
+                        table_i += 1
+                    
+                    use_val = " ".join(use_lines)
+                    import json
+                    table_json = json.dumps({
+                        "lesson": lesson_val or "",
+                        "topic": topics,
+                        "use": use_val
+                    })
+                    
+                    if current_subsection:
+                        if current_subsection['content'].strip():
+                            current_module['subsections'].append(current_subsection)
+                    
+                    current_module['subsections'].append({
+                        'name': '_module_metadata_table_',
+                        'content': table_json
+                    })
+                    
+                    current_subsection = None
+                    i = table_i
+                    continue
 
         # Handle Inline Subsections
         # "Key principle: Close protection operatives..."

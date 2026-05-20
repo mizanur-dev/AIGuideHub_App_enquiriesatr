@@ -5,14 +5,11 @@ import os
 import uuid
 
 from pinecone import Pinecone
-from pinecone_text.sparse import BM25Encoder
 
 logger = logging.getLogger(__name__)
 
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index = pc.Index(os.getenv("PINECONE_INDEX"))
-
-bm25 = BM25Encoder().default()
 
 
 def _sanitize_metadata(metadata):

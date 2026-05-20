@@ -109,33 +109,35 @@ def infer_metadata(module_name: str, subsections_text: str) -> dict:
         logger.debug("Heuristic classification failed: %s", e)
         best_cat, conf = None, 0.0
 
-    if best_cat and conf >= threshold:
-        desc = _short_description(subsections_text or module_name or "")
-        logger.info("Heuristic metadata chosen for '%s': %s (conf=%.2f)", module_name, best_cat, conf)
-        return {"category": best_cat, "description": desc}
+    # Force LLM generation for metadata to ensure AI-based descriptions
+    # if best_cat and conf >= threshold:
+    #     desc = _short_description(subsections_text or module_name or "")
+    #     logger.info("Heuristic metadata chosen for '%s': %s (conf=%.2f)", module_name, best_cat, conf)
+    #     return {"category": best_cat, "description": desc}
 
     # Low confidence -> attempt LLM
     try:
-        # Import lazily; this avoids hard-dependency at import-time
         from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain_core.messages import HumanMessage
     except Exception as e:
         logger.debug("LLM integration not available: %s", e)
-        # fallback
         return {"category": best_cat or "FOUNDATION", "description": _short_description(subsections_text or module_name or "")}
 
-    try:
-        model = getattr(settings, "METADATA_GEMINI_MODEL", "gemini-2.5-flash") if settings is not None else "gemini-2.5-flash"
-        temp = float(getattr(settings, "METADATA_GEMINI_TEMPERATURE", 0.0)) if settings is not None else 0.0
-        max_tokens = int(getattr(settings, "METADATA_GEMINI_MAX_OUTPUT_TOKENS", 512)) if settings is not None else 512
-        api_key = getattr(settings, "GEMINI_API_KEY", None) if settings is not None else None
+    for attempt in range(3):
+        try:
+            model = getattr(settings, "METADATA_GEMINI_MODEL", "gemini-2.5-flash") if settings is not None else "gemini-2.5-flash"
+            temp = float(getattr(settings, "METADATA_GEMINI_TEMPERATURE", 0.0)) if settings is not None else 0.0
+            max_tokens = int(getattr(settings, "METADATA_GEMINI_MAX_OUTPUT_TOKENS", 512)) if settings is not None else 512
+            api_key = getattr(settings, "GEMINI_API_KEY", None) if settings is not None else None
 
-        llm = ChatGoogleGenerativeAI(model=model, google_api_key=api_key, temperature=temp, max_output_tokens=max_tokens)
+            llm = ChatGoogleGenerativeAI(model=model, google_api_key=api_key, temperature=temp, max_output_tokens=max_tokens)
 
-        prompt = f"""
+            prompt = f"""
 Return a JSON object ONLY with two fields: category and description.
 category must be one of: {', '.join(_CATEGORIES)}.
 description must be a short (one-sentence) summary of the module (max 200 characters).
+
+IMPORTANT: You must return valid JSON. Do not use unescaped double quotes inside the description.
 
 Module name: {module_name}
 
@@ -146,39 +148,42 @@ Respond with strict JSON only, for example:
 {{"category": "LEGAL", "description": "Short module summary"}}
 """
 
-        structured = llm.with_structured_output(_ModuleMetadataModel)
-        response = structured.invoke([HumanMessage(content=prompt)])
-
-        # pydantic model instance -> dict
-        if hasattr(response, "model_dump"):
-            result = response.model_dump()
-        elif isinstance(response, dict):
-            result = response
-        else:
-            # attempt best-effort parse
-            txt = str(response)
-            # try to extract JSON object
+            response = llm.invoke([HumanMessage(content=prompt)])
+            txt = getattr(response, "content", str(response))
+            
             import json
-
+            import re
+            
             obj = None
             m = re.search(r"\{.*\}", txt, re.DOTALL)
             if m:
                 try:
                     obj = json.loads(m.group(0))
                 except Exception:
-                    obj = None
+                    # Fallback for minor JSON errors like unescaped quotes
+                    import ast
+                    try:
+                        obj = ast.literal_eval(m.group(0))
+                    except Exception:
+                        pass
+            
             result = obj or {}
 
-        category = (result.get("category") or "").upper() if isinstance(result, dict) else ""
-        if category not in _CATEGORIES:
-            logger.warning("LLM returned invalid category '%s' for module '%s'", category, module_name)
-            raise ValueError("Invalid category from LLM")
+            category = (result.get("category") or "").upper()
+            if category not in _CATEGORIES:
+                raise ValueError(f"Invalid category from LLM: {category}")
 
-        description = str(result.get("description") or "").strip()
-        logger.info("LLM metadata for '%s': %s", module_name, category)
-        return {"category": category, "description": description}
+            description = str(result.get("description") or "").strip()
+            if not description:
+                raise ValueError("LLM returned empty description")
 
-    except Exception as e:
-        logger.warning("Metadata LLM failed for module '%s': %s", module_name, e)
-        # final graceful fallback
-        return {"category": best_cat or "FOUNDATION", "description": _short_description(subsections_text or module_name or "")}
+            logger.info("LLM metadata for '%s': %s (Attempt %d)", module_name, category, attempt + 1)
+            return {"category": category, "description": description}
+
+        except Exception as e:
+            logger.warning("Metadata LLM attempt %d failed for module '%s': %s", attempt + 1, module_name, e)
+            if attempt == 2:
+                # Final graceful fallback after all retries
+                return {"category": best_cat or "FOUNDATION", "description": _short_description(subsections_text or module_name or "")}
+            import time
+
